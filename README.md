@@ -8,8 +8,8 @@ Production-ready enterprise B2B web application that automatically extracts stru
 
 * **Zero-Loss Part Number Retention**: Automatically enforces text-mode `@` formatting for part numbers (`00138737`, `02174072`, `02305474`) so leading zeros are never stripped or converted to numbers.
 * **100% Excel Template Preservation**: Preserves merged cells, formulas (`=D14*F14`, `=SUM(...)`), custom fonts, border styles, column widths, row heights, print settings, and branding.
-* **Deterministic Multi-Step Validation Engine**: Validates AI extractions against raw PyMuPDF text, checks price arithmetic (`Qty * Unit Price * (1 - Discount/100) == Total`), verifies grand totals, and computes field-level confidence ratings (`✓ Verified`, `⚠ Review`, `✕ Error`).
-* **Equipment & Machine Grouping**: Automatically identifies and groups line items associated with specific equipment or serial numbers (e.g. `ROTARY VALVE DMN BL-300-DAIRY APS`, S/N `RVNL170001`).
+* **Deterministic Multi-Step Validation Engine**: Validates AI extractions against raw PyMuPDF text, checks price arithmetic , verifies grand totals, and computes field-level confidence ratings (`✓ Verified`, `⚠ Review`, `✕ Error`).
+* **Equipment & Machine Grouping**: Automatically identifies and groups line items associated with specific equipment or serial numbers 
 * **Dynamic Pricing & Margin Modes**: Support for 3 distinct pricing strategies:
   1. *Quoted PDF Price* (Raw supplier pricing)
   2. *Supplier Discount* (Net cost deduction)
