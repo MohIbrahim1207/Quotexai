@@ -394,8 +394,11 @@ class ExcelTemplateService:
                 # Column B: Part Number - CRITICAL RULE: STRICT STRING WITH '@' NUMBER FORMAT
                 if mapping.part_number_column:
                     cell = sheet[f"{mapping.part_number_column}{current_row}"]
-                    cell.value = str(item.part_number)
-                    cell.number_format = "@"
+                    if item.part_number:
+                        cell.value = str(item.part_number)
+                        cell.number_format = "@"
+                    else:
+                        cell.value = None
 
                 # Column C: Description
                 if mapping.description_column:
@@ -522,12 +525,13 @@ class ExcelTemplateService:
 
             row_str = " ".join(str(v).strip() for v in (a_val, b_val, c_val) if v is not None).lower()
 
-            # Skip equipment group headers and section titles
-            if any(k in row_str for k in equipment_keywords):
+            # Skip equipment group headers and section titles (where price and qty are absent, or column A is the group title text)
+            is_item_row = (isinstance(a_val, (int, float)) or (isinstance(a_val, str) and a_val.strip().isdigit())) and (d_val is not None or e_val is not None)
+            if not is_item_row and any(k in row_str for k in equipment_keywords):
                 continue
 
             # Skip table headers and currency rows
-            if any(k in row_str for k in ["part number", "item no", "description", "unit price", "qty", "euro", "eur", "usd", "inr"]):
+            if not is_item_row and any(k in row_str for k in ["part number", "item no", "description", "unit price", "qty", "euro", "eur", "usd", "inr"]):
                 continue
 
             # Check for valid part number in designated part number column
@@ -544,29 +548,49 @@ class ExcelTemplateService:
                         "cell_format": sheet[f"{pn_col}{r}"].number_format,
                     })
                     logger.info(f"Excel verification counted row {r} as an item (Part Number: '{pn}', Line: {a_val}, Qty: {e_val}, Unit Price: {d_val})")
+            elif (b_val is None or str(b_val).strip() == "") and c_val is not None and str(c_val).strip():
+                c_str = str(c_val).strip()
+                if c_str.lower() not in ("description", "part number", "item description", "spec", "specification"):
+                    if a_val is not None or d_val is not None or e_val is not None:
+                        written_items.append({
+                            "row": r,
+                            "line_number": a_val,
+                            "part_number": "",
+                            "description": c_val,
+                            "unit_price": d_val,
+                            "quantity": e_val,
+                            "cell_format": sheet[f"{pn_col}{r}"].number_format,
+                        })
+                        logger.info(f"Excel verification counted row {r} as an item without part number (Line: {a_val}, Description: '{c_val}', Qty: {e_val}, Unit Price: {d_val})")
 
         wb.close()
 
         # Check 1: Exact count of quotation items
         if len(written_items) != expected_count:
-            counted_rows_desc = ", ".join(f"Row {it['row']}: {it['part_number']}" for it in written_items)
+            counted_rows_desc = ", ".join(f"Row {it['row']}: '{it['part_number'] or it['description']}'" for it in written_items)
             raise ValueError(
                 f"Excel verification failed: Expected {expected_count} quotation items in Excel, but found {len(written_items)} ({counted_rows_desc})."
             )
 
         # Check 2: All PDF part numbers, quantities, unit prices, and leading zeros
-        written_map = {str(it["part_number"]).strip(): it for it in written_items}
+        written_map = {str(it["part_number"]).strip(): it for it in written_items if it.get("part_number")}
         for item in quotation.items:
-            expected_pn = str(item.part_number).strip()
+            expected_pn = str(item.part_number).strip() if item.part_number else ""
             if not expected_pn:
-                continue
-
-            if expected_pn not in written_map:
-                raise ValueError(
-                    f"Excel verification failed: Part number '{expected_pn}' from PDF is missing in generated Excel."
-                )
-
-            entry = written_map[expected_pn]
+                matched_entry = None
+                for entry in written_items:
+                    if entry["line_number"] == item.line_number or (entry["description"] and item.description and item.description in str(entry["description"])):
+                        matched_entry = entry
+                        break
+                if not matched_entry:
+                    raise ValueError(f"Excel verification failed: Item '{item.description}' from PDF is missing in generated Excel.")
+                entry = matched_entry
+            else:
+                if expected_pn not in written_map:
+                    raise ValueError(
+                        f"Excel verification failed: Part number '{expected_pn}' from PDF is missing in generated Excel."
+                    )
+                entry = written_map[expected_pn]
 
             # Check quantity matches if quantity column is in template
             if mapping and mapping.quantity_column and item.quantity is not None:
@@ -575,7 +599,7 @@ class ExcelTemplateService:
                     try:
                         if abs(float(excel_qty) - float(item.quantity)) > 0.001:
                             raise ValueError(
-                                f"Excel mapping verification failed: For part '{expected_pn}', expected Quantity {item.quantity} in column {mapping.quantity_column} but found {excel_qty}."
+                                f"Excel mapping verification failed: For item '{expected_pn or item.description}', expected Quantity {item.quantity} in column {mapping.quantity_column} but found {excel_qty}."
                             )
                     except (ValueError, TypeError):
                         pass
@@ -587,7 +611,7 @@ class ExcelTemplateService:
                     try:
                         if abs(float(excel_price) - float(item.unit_price)) > 0.01:
                             raise ValueError(
-                                f"Excel mapping verification failed: For part '{expected_pn}', expected Unit Price {item.unit_price} in column {mapping.unit_price_column} but found {excel_price}."
+                                f"Excel mapping verification failed: For item '{expected_pn or item.description}', expected Unit Price {item.unit_price} in column {mapping.unit_price_column} but found {excel_price}."
                             )
                     except (ValueError, TypeError):
                         pass

@@ -18,7 +18,7 @@ class FieldConfidence(BaseModel):
 
 class QuoteItem(BaseModel):
     line_number: int
-    part_number: str = Field(..., description="Part number as exact string. Must preserve leading zeros.")
+    part_number: str = Field("", description="Part number as exact string. Must preserve leading zeros.")
     description: str = ""
     quantity: Optional[float] = None
     unit: Optional[str] = None
@@ -27,11 +27,12 @@ class QuoteItem(BaseModel):
     currency: Optional[str] = "EUR"
     currency_symbol: Optional[str] = "€"
     discount_percent: Optional[float] = None
+    net_price: Optional[float] = None
     total_price: Optional[float] = None
     total_price_detail: Optional[PriceDetail] = None
     commodity_code: Optional[str] = None
     equipment_group: Optional[str] = None
-    item_type: Optional[str] = "part"  # "part", "charge", "service", "non_inventory"
+    item_type: Optional[str] = "part"  # "part", "charge", "service", "non_inventory", "machine"
     source_page: Optional[int] = 1
     confidence: dict[str, float] = Field(default_factory=dict)
     status: str = "verified"  # "verified", "warning", "error"
@@ -63,7 +64,7 @@ class QuoteItem(BaseModel):
         except (ValueError, TypeError):
             return None
 
-    @field_validator("total_price", mode="before")
+    @field_validator("total_price", "net_price", mode="before")
     @classmethod
     def parse_total_price(cls, v: Any) -> Optional[float]:
         if isinstance(v, dict):
@@ -87,9 +88,12 @@ class EquipmentGroup(BaseModel):
 class QuotationData(BaseModel):
     quote_number: Optional[str] = None
     quote_date: Optional[str] = None
+    quotation_date: Optional[str] = None
     expiry_date: Optional[str] = None
     supplier_name: Optional[str] = None
     customer: Optional[str] = None
+    subject: Optional[str] = None
+    layout_type: Optional[str] = "table"  # "table" or "descriptive"
     payment_terms: Optional[str] = None
     delivery_terms: Optional[str] = None
     sales_person: Optional[str] = None
@@ -108,6 +112,13 @@ class QuotationData(BaseModel):
     raw_pdf_text: Optional[str] = None
     source_pdf_id: Optional[str] = None
     template_id: Optional[str] = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.quote_date and not self.quotation_date:
+            self.quotation_date = self.quote_date
+        elif self.quotation_date and not self.quote_date:
+            self.quote_date = self.quotation_date
+
 
 
 class ValidationIssue(BaseModel):

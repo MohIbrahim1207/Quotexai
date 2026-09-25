@@ -107,18 +107,35 @@ class ValidationService:
                 part_number_validation_passed += 1
                 item_notes.append(f"Non-inventory charge ({label})")
             elif not pn:
-                # True extraction failure on a physical part item
-                issues.append(
-                    ValidationIssue(
-                        item_line=item.line_number,
-                        field="part_number",
-                        issue_type="error",
-                        message=f"Line {item.line_number}: Missing part number.",
+                if getattr(quotation, "layout_type", None) == "descriptive" or getattr(item, "item_type", None) in ("machine", "product", "equipment", "descriptive"):
+                    # Descriptive machine/equipment quotation: OEM stock part number not applicable/available in PDF
+                    if getattr(item, "item_type", None) == "part":
+                        item.item_type = "machine"
+                    issues.append(
+                        ValidationIssue(
+                            item_line=item.line_number,
+                            field="part_number",
+                            issue_type="info",
+                            message=f"Line {item.line_number}: Quoted product ({item.description}) — OEM stock part number not provided in source quotation.",
+                            actual_value="",
+                        )
                     )
-                )
-                errors_count += 1
-                item_status = "error"
-                item_confidence["part_number"] = 0.0
+                    item_confidence["part_number"] = 1.0
+                    part_number_validation_passed += 1
+                    item_notes.append("Main product quotation (OEM part number not applicable)")
+                else:
+                    # True extraction failure on a physical part item
+                    issues.append(
+                        ValidationIssue(
+                            item_line=item.line_number,
+                            field="part_number",
+                            issue_type="error",
+                            message=f"Line {item.line_number}: Missing part number.",
+                        )
+                    )
+                    errors_count += 1
+                    item_status = "error"
+                    item_confidence["part_number"] = 0.0
             elif pn.startswith("848190") and "commodity" in (item.description or "").lower():
                 issues.append(
                     ValidationIssue(

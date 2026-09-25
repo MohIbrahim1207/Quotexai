@@ -33,8 +33,24 @@ SYMBOL_TO_CURRENCY: dict[str, str] = {
 }
 
 
+MONTH_MAP: dict[str, int] = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
 def normalize_price(price_str: Any) -> Optional[float]:
-    """Parses various price formats ($1,234.56, 1.234,56 €, € 562.00, \ufffd 1,240.59, 85,000.00, etc.) to float."""
+    """Parses various price formats ($1,234.56, 1.234,56 €, € 26.268,00, € 3.317,-, € 1.890, \ufffd 1,240.59, etc.) to float."""
     if price_str is None:
         return None
     if isinstance(price_str, (int, float)):
@@ -45,6 +61,8 @@ def normalize_price(price_str: Any) -> Optional[float]:
     cleaned = re.sub(r'[\ufffd€$£₹¥\s]', '', cleaned)
     # Remove currency words if attached
     cleaned = re.sub(r'(?i)\b(eur|usd|inr|gbp|idr|jpy|cny|sgd|rs|rp)\b', '', cleaned).strip()
+    # Handle European dash notation: e.g. 3.317,- or 711.- or 3.317,– -> 3.317,00
+    cleaned = re.sub(r'[,.][\-–]\s*$', ',00', cleaned)
     # Remove non-numeric except dot, comma, minus
     cleaned = re.sub(r'[^\d.,\-]', '', cleaned)
     if not cleaned or cleaned in ('-', '.', ','):
@@ -53,10 +71,10 @@ def normalize_price(price_str: Any) -> Optional[float]:
     # Handle European decimal: e.g. 1.234,56 -> 1234.56 or 562,00 -> 562.00
     if ',' in cleaned and '.' in cleaned:
         if cleaned.rfind(',') > cleaned.rfind('.'):
-            # 1.234,56 format
+            # European: 1.234,56 format (e.g. 26.268,00 -> 26268.00)
             cleaned = cleaned.replace('.', '').replace(',', '.')
         else:
-            # 1,234.56 format (e.g. 1,240.59 -> 1240.59)
+            # US/UK: 1,234.56 format (e.g. 1,240.59 -> 1240.59)
             cleaned = cleaned.replace(',', '')
     elif ',' in cleaned:
         parts = cleaned.split(',')
@@ -65,11 +83,49 @@ def normalize_price(price_str: Any) -> Optional[float]:
         else:
             # 85,000 without decimals -> 85000
             cleaned = cleaned.replace(',', '')
+    elif '.' in cleaned:
+        # Check if dot is a European thousands separator (e.g. 1.890 or 26.268)
+        if re.match(r'^-?\d{1,3}(?:\.\d{3})+$', cleaned):
+            cleaned = cleaned.replace('.', '')
             
     try:
         return float(cleaned)
     except ValueError:
         return None
+
+
+def normalize_date(date_str: Any) -> Optional[str]:
+    """Normalizes dates into ISO YYYY-MM-DD format (e.g. '21 September 2026' -> '2026-09-21')."""
+    if not date_str:
+        return None
+    cleaned = str(date_str).strip()
+    # Already YYYY-MM-DD
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', cleaned):
+        return cleaned
+    
+    # 21 September 2026 or 21-Sep-2026
+    m = re.search(r'(\d{1,2})\s*[-/\s]\s*([A-Za-z]+)\s*[-/\s]\s*(\d{4})', cleaned)
+    if m:
+        day = int(m.group(1))
+        m_str = m.group(2).lower()
+        year = int(m.group(3))
+        month = MONTH_MAP.get(m_str)
+        if month:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+            
+    # DD/MM/YYYY or MM/DD/YYYY
+    m2 = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})', cleaned)
+    if m2:
+        p1 = int(m2.group(1))
+        p2 = int(m2.group(2))
+        yr = int(m2.group(3))
+        # Ambiguity check: if p1 > 12, p1 is day
+        if p1 > 12:
+            return f"{yr:04d}-{p2:02d}-{p1:02d}"
+        return f"{yr:04d}-{p1:02d}-{p2:02d}"
+        
+    return cleaned
+
 
 
 def extract_currency(text: str) -> str:

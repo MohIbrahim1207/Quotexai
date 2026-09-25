@@ -17,7 +17,12 @@ import type {
 } from '../types/quotation';
 import { AlertCircle } from 'lucide-react';
 
-export const Dashboard: React.FC = () => {
+interface DashboardProps {
+  activeModule?: 'quotation' | 'supplier_pricing' | 'history';
+  onSelectModule?: (mod: 'quotation' | 'supplier_pricing' | 'history') => void;
+}
+
+export const Dashboard: React.FC<DashboardProps> = ({ activeModule, onSelectModule }) => {
   const [step, setStep] = useState<'upload' | 'processing' | 'review' | 'success'>('upload');
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [pdfId, setPdfId] = useState<string | null>(null);
@@ -189,7 +194,12 @@ export const Dashboard: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-[#F5F1E8] text-[#26231F] flex flex-col font-sans selection:bg-[#C98B4A]/20 selection:text-[#26231F]">
-      <Header onReset={handleReset} isBusy={step === 'processing' || isGenerating} />
+      <Header
+        onReset={handleReset}
+        isBusy={step === 'processing' || isGenerating}
+        activeModule={activeModule}
+        onSelectModule={onSelectModule}
+      />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
         {/* Error Banner */}

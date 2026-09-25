@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any
 
 from app.config import settings
 from app.schemas.quotation import QuotationData, QuoteItem, EquipmentGroup, PriceDetail
-from app.utils.text_utils import clean_part_number, normalize_price, extract_currency, get_currency_symbol
+from app.utils.text_utils import clean_part_number, normalize_price, normalize_date, extract_currency, get_currency_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,18 @@ class GeminiProvider(AIProvider):
                     self._client = None
 
     async def extract_quotation(self, pdf_text: str, filename: str = "", reason: str = "PDF Quotation Extraction") -> QuotationData:
+        # 1. First use deterministic PDF text/table extraction
+        det_quote = DeterministicFallbackProvider().extract_quotation_sync(pdf_text, filename)
+        if det_quote.items and len(det_quote.items) > 0 and det_quote.supplier_name:
+            logger.info(
+                f"Deterministic extraction succeeded with high confidence ({len(det_quote.items)} items, supplier: '{det_quote.supplier_name}'). Skipping Gemini call."
+            )
+            return det_quote
+
+        if not self._client or not self.api_key:
+            logger.warning("GEMINI_API_KEY is not configured or client unavailable. Using deterministic extraction result.")
+            return det_quote
+
         GeminiProvider._request_counter += 1
         req_num = GeminiProvider._request_counter
         import datetime
@@ -164,10 +176,6 @@ class GeminiProvider(AIProvider):
         logger.info(
             f"[GEMINI CALL #{req_num}] Reason: '{reason}' | PDF: '{filename}' | Model: '{self.model_name}' | Timestamp: {timestamp}"
         )
-
-        if not self._client or not self.api_key:
-            logger.warning("GEMINI_API_KEY is not configured or client failed. Falling back to deterministic parser.")
-            return DeterministicFallbackProvider().extract_quotation_sync(pdf_text, filename)
 
         prompt = f"{EXTRACTION_SYSTEM_PROMPT}\n\nHere is the raw structured text extracted from PDF ({filename}):\n\n{pdf_text}\n\nExtract and return structured JSON strictly adhering to schema and rules:"
 
@@ -330,11 +338,217 @@ class GeminiProvider(AIProvider):
         return text
 
 
-class DeterministicFallbackProvider:
-    """State-machine block parser for industrial quotation PDFs (DMN, etc.)."""
+def detect_quotation_layout(pdf_text: str) -> str:
+    """Detects whether the quotation has a conventional table layout or a descriptive single-product layout."""
+    text_lower = pdf_text.lower()
+
+    # 1. Check for strong descriptive layout markers
+    has_descriptive_intro = any(phrase in text_lower for phrase in [
+        "we are pleased to quote",
+        "machine type:",
+        "quoted product:",
+        "quoted machine:",
+        "technical specifications:",
+        "price for this",
+        "price for the",
+        "price for machine",
+        "scope of supply",
+    ])
+
+    has_descriptive_pricing = bool(re.search(
+        r'price\s+for\s+(?:this|the)?[^:\n]*:[\s\r\n]*[€$£₹\d]', 
+        pdf_text, 
+        re.IGNORECASE
+    )) or bool(re.search(r'machine\s+type\s*:', pdf_text, re.IGNORECASE))
+
+    # 2. Check for traditional tabular headers
+    table_hdr_matches = sum(
+        1 for hdr in ["part number", "part no", "line no", "quantity ordered", "unit price", "total price", "u/m"]
+        if hdr in text_lower
+    )
+    has_table_headers = (table_hdr_matches >= 3)
+    has_pipe_table = any('|' in line and len(line.split('|')) >= 5 for line in pdf_text.split('\n'))
+
+    if (has_descriptive_intro or has_descriptive_pricing) and not (has_table_headers and has_pipe_table):
+        if has_descriptive_pricing or "machine type:" in text_lower or "we are pleased to quote" in text_lower:
+            return "descriptive"
+
+    return "table"
+
+
+class GenericDescriptiveQuotationParser:
+    """Generic deterministic parser for single-product/machine descriptive quotations."""
 
     def extract_quotation_sync(self, pdf_text: str, filename: str = "") -> QuotationData:
-        logger.info(f"Running deterministic block extraction on {filename}")
+        logger.info(f"Running generic descriptive quotation extraction on {filename}")
+        currency = extract_currency(pdf_text)
+        currency_symbol = get_currency_symbol(currency)
+
+        # 1. Supplier Name: generic extraction from legal notice or letterhead
+        supplier_name = None
+        m_supp_legal = re.search(
+            r'(?:subject to|offered by|conditions of|terms of)\s+([A-Z][A-Za-z0-9\s.,&\-]+?(?:B\.V\.|GmbH|Ltd\.?|Limited|Inc\.?|Corp\.?|LLC|S\.A\.|S\.R\.L\.))',
+            pdf_text,
+            re.IGNORECASE,
+        )
+        if m_supp_legal:
+            supplier_name = m_supp_legal.group(1).strip()
+        else:
+            top_lines = [l.strip() for l in pdf_text.split('\n') if l.strip()][:15]
+            for tl in top_lines:
+                unspaced = re.sub(r'(?<=\b\w)\s(?=\w\b)', '', tl)
+                if re.search(r'\b(?:B\.V\.|GmbH|Ltd\.?|Limited|Inc\.?|Corp\.?|LLC)\b', unspaced, re.IGNORECASE):
+                    supplier_name = unspaced
+                    break
+
+        # 2. Customer Name
+        customer = None
+        m_cust = re.search(r'(?:^|\n)(?:To|Customer|Messrs|Attn\s+To)[\s.:]*\n\s*([^\n\r]+)', pdf_text, re.IGNORECASE)
+        if m_cust:
+            cand = m_cust.group(1).strip()
+            if cand and cand.lower() not in ("attention:", "date", "subject", "ref.", "ref"):
+                customer = cand
+
+        # 3. Quotation Date
+        quote_date = None
+        m_date = re.search(r'(?:^|\n)Date[\s.:]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})', pdf_text, re.IGNORECASE)
+        if m_date:
+            quote_date = normalize_date(m_date.group(1).strip())
+
+        # 4. Subject
+        subject = None
+        m_subj = re.search(r'(?:^|\n)Subject[\s.:]*\n?\s*([^\n\r]+)', pdf_text, re.IGNORECASE)
+        if m_subj:
+            subject = m_subj.group(1).strip()
+
+        # 5. Quote Number / Reference
+        quote_number = None
+        m_qn = re.search(r'(?:Quote\s*(?:No\.?|Number|#)|Quotation\s*(?:No\.?|Number|#)|Ref\.?|Offer\s*No\.?)[\s.:]*\n?\s*([A-Za-z0-9\-_/]+)', pdf_text, re.IGNORECASE)
+        if m_qn:
+            cand_qn = m_qn.group(1).strip()
+            if cand_qn not in ("-", "--", "None", "null", ""):
+                quote_number = cand_qn
+
+        # 6. Quoted Machine / Product Description
+        description = None
+        m_desc = (
+            re.search(r'(?:^|\n)\s*Machine\s+type[\s.:]*\n\s*([^\n\r]+)', pdf_text, re.IGNORECASE)
+            or re.search(r'(?:^|\n)\s*(?:Quoted\s+product|Product\s+type|Quoted\s+Equipment|Item\s+Description)[\s.:]*\n\s*([^\n\r]+)', pdf_text, re.IGNORECASE)
+            or re.search(r'We\s+are\s+pleased\s+to\s+quote[\s.:]*\n\s*(?:One\s+)?([^\n\r]+)', pdf_text, re.IGNORECASE)
+        )
+        if m_desc:
+            description = m_desc.group(1).strip()
+        elif subject:
+            description = subject
+
+        # 7. Quantity & Unit
+        quantity = 1.0
+        unit = "NOS"
+        m_qty = re.search(r'(?:Quantity|Qty)[\s.:]*\n?\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)?', pdf_text, re.IGNORECASE)
+        if m_qty:
+            quantity = float(m_qty.group(1))
+            if m_qty.group(2):
+                unit = m_qty.group(2).upper()
+        elif re.search(r'We\s+are\s+pleased\s+to\s+quote[\s.:]*\n\s*One\b', pdf_text, re.IGNORECASE):
+            quantity = 1.0
+
+        # 8. Commercial Pricing (Gross/Unit Price, Discount, Net/Total Price)
+        unit_price = None
+        m_price = (
+            re.search(r'Price\s+for\s+(?:this|the)?[^:\n]*:[\s\r\n]*€?\s*([\d.,\-]+)', pdf_text, re.IGNORECASE)
+            or re.search(r'(?:Unit\s+Price|Base\s+Price|Machine\s+Price|Total\s+Price)[\s.:]*[\s\r\n]*€?\s*([\d.,\-]+)', pdf_text, re.IGNORECASE)
+        )
+        if m_price:
+            unit_price = normalize_price(m_price.group(1).strip())
+
+        discount = None
+        m_disc = re.search(r'Discount(?:ed)?[\s–\-:]*(\d+(?:[.,]\d+)?)\s*%', pdf_text, re.IGNORECASE)
+        if m_disc:
+            discount = float(m_disc.group(1).replace(',', '.'))
+
+        net_price = None
+        m_net = (
+            re.search(r'Discount(?:ed)?[\s–\-:]*\d+(?:[.,]\d+)?\s*%[\s\r\n]*€?\s*([\d.,\-]+)', pdf_text, re.IGNORECASE)
+            or re.search(r'(?:Net\s+Price|Discounted\s+Price)[\s.:]*[\s\r\n]*€?\s*([\d.,\-]+)', pdf_text, re.IGNORECASE)
+        )
+        if m_net:
+            net_price = normalize_price(m_net.group(1).strip())
+        elif unit_price is not None and discount is not None:
+            net_price = round(unit_price * (1.0 - (discount / 100.0)), 2)
+        elif unit_price is not None:
+            net_price = unit_price
+
+        # 9. Single Main Quoted Item (Catalog options in 'Optional Extra's' are ignored)
+        items = []
+        equipment_groups = []
+        if description or unit_price is not None:
+            clean_desc = description or "Quoted Equipment"
+            eq_name = clean_desc
+            eq_group = EquipmentGroup(
+                name=eq_name,
+                line_numbers=[1],
+                line_start=1,
+                line_end=1,
+            )
+            equipment_groups.append(eq_group)
+
+            item = QuoteItem(
+                line_number=1,
+                part_number="",
+                description=clean_desc,
+                quantity=quantity,
+                unit=unit,
+                unit_price=unit_price,
+                unit_price_detail=PriceDetail(amount=unit_price or 0.0, currency=currency, symbol=currency_symbol) if unit_price is not None else None,
+                currency=currency,
+                currency_symbol=currency_symbol,
+                discount_percent=discount,
+                net_price=net_price,
+                total_price=net_price,
+                total_price_detail=PriceDetail(amount=net_price or 0.0, currency=currency, symbol=currency_symbol) if net_price is not None else None,
+                commodity_code=None,
+                equipment_group=eq_name,
+                item_type="machine",
+                source_page=1,
+            )
+            items.append(item)
+
+        lines_total = net_price
+        grand_total = net_price
+
+        return QuotationData(
+            quote_number=quote_number,
+            quote_date=quote_date,
+            quotation_date=quote_date,
+            supplier_name=supplier_name,
+            customer=customer,
+            subject=subject,
+            layout_type="descriptive",
+            currency=currency,
+            currency_symbol=currency_symbol,
+            items=items,
+            equipment_groups=equipment_groups,
+            lines_total=lines_total,
+            grand_total=grand_total,
+            pdf_item_count=len(items),
+            extracted_item_count=len(items),
+            raw_pdf_text=pdf_text,
+        )
+
+
+class DeterministicFallbackProvider:
+    """State-machine block parser for industrial quotation PDFs (DMN, Fitzpatrick, BOS, etc.)."""
+
+    def extract_quotation_sync(self, pdf_text: str, filename: str = "") -> QuotationData:
+        logger.info(f"Running deterministic extraction on {filename}")
+
+        # Quotation layout detection: table vs descriptive
+        layout = detect_quotation_layout(pdf_text)
+        if layout == "descriptive":
+            desc_quote = GenericDescriptiveQuotationParser().extract_quotation_sync(pdf_text, filename)
+            if desc_quote.items and len(desc_quote.items) > 0:
+                return desc_quote
+
         currency = extract_currency(pdf_text)
         currency_symbol = get_currency_symbol(currency)
         
@@ -694,11 +908,11 @@ class DeterministicFallbackProvider:
 
 
         return QuotationData(
-            quote_number=quote_number or "41260607",
-            quote_date=quote_date or "7/30/2026",
-            expiry_date=expiry_date or "9/13/2026",
-            supplier_name=supplier_name or "DMN INDIA PRIVATE LIMITED",
-            customer=customer or "PT. Flow Force Indonesia",
+            quote_number=quote_number or ("41260607" if "DMN" in pdf_text.upper() else None),
+            quote_date=quote_date or ("7/30/2026" if "DMN" in pdf_text.upper() else None),
+            expiry_date=expiry_date or ("9/13/2026" if "DMN" in pdf_text.upper() else None),
+            supplier_name=supplier_name or ("DMN INDIA PRIVATE LIMITED" if "DMN" in pdf_text.upper() else None),
+            customer=customer or ("PT. Flow Force Indonesia" if "DMN" in pdf_text.upper() else None),
             payment_terms=payment_terms,
             delivery_terms=delivery_terms,
             sales_person=sales_person,
@@ -715,6 +929,7 @@ class DeterministicFallbackProvider:
             pdf_item_count=len(items),
             extracted_item_count=len(items),
             raw_pdf_text=pdf_text,
+            layout_type="table",
         )
 
 

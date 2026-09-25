@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.api import health, quotation, history
+from app.api import health, quotation, history, supplier_pricing
 
 # Configure logging
 logging.basicConfig(
@@ -54,6 +54,19 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(health.router, prefix=settings.API_V1_STR)
 app.include_router(quotation.router, prefix=settings.API_V1_STR)
 app.include_router(history.router, prefix=settings.API_V1_STR)
+app.include_router(supplier_pricing.router, prefix=settings.API_V1_STR)
+
+
+@app.get("/health", tags=["Health"])
+async def root_health_check():
+    """Root health check endpoint for Docker and load balancers."""
+    return {
+        "status": "healthy",
+        "service": settings.PROJECT_NAME,
+        "version": settings.VERSION,
+        "ai_model": settings.GEMINI_MODEL,
+        "gemini_api_configured": bool(settings.GEMINI_API_KEY),
+    }
 
 
 @app.on_event("startup")

@@ -1,0 +1,78 @@
+services:
+  database:
+    image: alpine:3.20
+    container_name: quotexai_database
+    restart: unless-stopped
+    volumes:
+      - quotexai_data:/data
+    command: >
+      sh -c "apk add --no-cache sqlite &&
+             echo 'QuotexAI SQLite database storage initialized at /data' &&
+             while true; do
+               sleep 86400;
+               if [ -f /data/supplier_pricing_history.db ]; then
+                 sqlite3 /data/supplier_pricing_history.db 'PRAGMA integrity_check;' > /dev/null 2>&1 || true;
+               fi;
+             done"
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /data"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - quotexai_network
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: quotexai_backend
+    restart: unless-stopped
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost}
+      - ZOHO_BOOKS_ORGANIZATION_ID=${ZOHO_BOOKS_ORGANIZATION_ID:-741367552}
+      - ZOHO_BOOKS_CLIENT_ID=${ZOHO_BOOKS_CLIENT_ID:-}
+      - ZOHO_BOOKS_CLIENT_SECRET=${ZOHO_BOOKS_CLIENT_SECRET:-}
+      - ZOHO_BOOKS_GRANT_TOKEN=${ZOHO_BOOKS_GRANT_TOKEN:-}
+      - ZOHO_BOOKS_ACCOUNTS_URL=${ZOHO_BOOKS_ACCOUNTS_URL:-https://accounts.zoho.com}
+      - ZOHO_BOOKS_API_DOMAIN=${ZOHO_BOOKS_API_DOMAIN:-https://www.zohoapis.com}
+      - ZOHO_CONNECTION_NAME=${ZOHO_CONNECTION_NAME:-zoho_books_automation}
+      - ZOHO_TOKEN_CACHE_PATH=${ZOHO_TOKEN_CACHE_PATH:-/app/outputs/zoho_tokens.json}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-25}
+      - TEMP_EXPIRATION_HOURS=${TEMP_EXPIRATION_HOURS:-24}
+    volumes:
+      - quotexai_data:/app/outputs
+      - quotexai_uploads:/app/uploads
+    expose:
+      - "8000"
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - quotexai_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: quotexai_frontend
+    restart: unless-stopped
+    ports:
+      - "${PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - quotexai_network
+
+volumes:
+  quotexai_data:
+    driver: local
+  quotexai_uploads:
+    driver: local
+
+networks:
+  quotexai_network:
+    driver: bridge
