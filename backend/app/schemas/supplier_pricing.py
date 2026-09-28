@@ -133,7 +133,8 @@ class PricingConfigParameters(BaseModel):
 class CalculatedLinePrice(BaseModel):
     """Full step-by-step pricing breakdown for an individual quotation line item."""
     line_number: int
-    part_number: str
+    part_number: str = ""
+    sku: Optional[str] = None
     description: str
     quantity: float
     unit: str
@@ -247,6 +248,7 @@ class ZohoItemSyncRecord(BaseModel):
     existing_item_id: Optional[str] = None
     status: str = Field("ready", description="'ready' | 'synced' | 'skipped'")
     notes: Optional[str] = None
+    sku: Optional[str] = None
 
 
 class ZohoSyncConfig(BaseModel):

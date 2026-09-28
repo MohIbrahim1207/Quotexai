@@ -33,7 +33,7 @@ from app.schemas.supplier_pricing import (
     ZohoExecuteSyncResponse,
 )
 from app.services.pdf_service import pdf_service
-from app.utils.text_utils import extract_currency, normalize_price, clean_part_number
+from app.utils.text_utils import extract_currency, normalize_price, clean_part_number, normalize_sku
 
 logger = logging.getLogger(__name__)
 
@@ -903,7 +903,8 @@ class SupplierPricingService:
         sku_lookup_cache: dict[str, Optional[dict[str, Any]]] = {}
 
         for item in req.calculated_items:
-            part_no = (item.part_number or "").strip()
+            raw_sku = getattr(item, "sku", None) or getattr(item, "part_number", None) or ""
+            part_no = str(raw_sku).strip()
             desc = (item.description or "").strip()
 
             # Filter if search query specified
@@ -911,14 +912,15 @@ class SupplierPricingService:
                 continue
 
             matched_zoho_item = None
-            if part_no:
-                if part_no in sku_lookup_cache:
-                    matched_zoho_item = sku_lookup_cache[part_no]
+            norm_key = normalize_sku(part_no)
+            if norm_key:
+                if norm_key in sku_lookup_cache:
+                    matched_zoho_item = sku_lookup_cache[norm_key]
                 else:
                     matched_zoho_item = zoho_books_service.find_item_by_exact_sku(
                         part_no, organization_id=org_id
                     )
-                    sku_lookup_cache[part_no] = matched_zoho_item
+                    sku_lookup_cache[norm_key] = matched_zoho_item
 
             if matched_zoho_item:
                 raw_id = str(matched_zoho_item.get("item_id") or "").strip()
@@ -935,6 +937,7 @@ class SupplierPricingService:
                         existing_item_id=raw_id,
                         status="ready",
                         notes=f"Matches existing item in Zoho Books (Item ID: {raw_id}, SKU: {matched_sku}). Selling rate will update to {item.target_currency} {item.final_unit_selling_price:.2f}.",
+                        sku=matched_sku,
                     )
                     items_to_update.append(record)
                     continue
@@ -951,6 +954,7 @@ class SupplierPricingService:
                 existing_item_id=None,
                 status="ready",
                 notes=f"New SKU not found in Zoho Books. Will create new Item Master in {req.zoho_config.environment} organization {org_id}.",
+                sku=part_no,
             )
             items_to_create.append(record)
 
@@ -1048,7 +1052,7 @@ class SupplierPricingService:
 
                 update_payload: dict[str, Any] = {
                     "name": existing_name,
-                    "sku": (it.part_number or "").strip(),
+                    "sku": (getattr(it, "sku", None) or it.part_number or "").strip(),
                     "rate": float(it.rate),
                 }
                 if it.purchase_rate:

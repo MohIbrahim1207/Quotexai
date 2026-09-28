@@ -188,3 +188,17 @@ def clean_part_number(raw_pn: Any) -> str:
     pn_str = re.sub(r'^["\']|["\']$', '', pn_str)
     return pn_str
 
+
+def normalize_sku(sku: Any) -> str:
+    """
+    Normalizes an SKU for deterministic matching:
+    - Strips leading and trailing whitespace.
+    - Collapses repeated internal whitespace sequences into a single space.
+    - Converts to lowercase for case-insensitive comparison.
+    """
+    if sku is None:
+        return ""
+    cleaned = str(sku).strip()
+    return " ".join(cleaned.split()).lower()
+
+
