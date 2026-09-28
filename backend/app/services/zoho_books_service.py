@@ -7,6 +7,7 @@ from typing import Optional, Any
 import httpx
 
 from app.config import settings, BASE_DIR
+from app.utils.text_utils import normalize_sku
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,15 @@ class ZohoTokenManager:
         self.client_id = settings.ZOHO_BOOKS_CLIENT_ID
         self.client_secret = settings.ZOHO_BOOKS_CLIENT_SECRET
         self.grant_token = settings.ZOHO_BOOKS_GRANT_TOKEN
+        self.refresh_token_env = (
+            os.getenv("ZOHO_BOOKS_REFRESH_TOKEN")
+            or os.getenv("ZOHO_REFRESH_TOKEN")
+            or getattr(settings, "ZOHO_BOOKS_REFRESH_TOKEN", "")
+            or ""
+        ).strip()
 
         # Dynamic fallback to self_client.json if any credential is unset
-        if not (self.client_id and self.client_secret and self.grant_token):
+        if not (self.client_id and self.client_secret):
             search_paths = [
                 BASE_DIR.parent / "self_client.json",
                 BASE_DIR / "self_client.json",
@@ -48,6 +55,8 @@ class ZohoTokenManager:
                                 self.client_secret = sc_data.get("client_secret") or sc_data.get("client_secret_id") or sc_data.get("installed", {}).get("client_secret") or ""
                             if not self.grant_token:
                                 self.grant_token = sc_data.get("code") or sc_data.get("grant_token") or ""
+                            if not self.refresh_token_env:
+                                self.refresh_token_env = (sc_data.get("refresh_token") or "").strip()
                     except Exception:
                         pass
 
@@ -55,8 +64,13 @@ class ZohoTokenManager:
         self._refresh_token: Optional[str] = None
         self._expires_at: float = 0.0
         self._token_api_domain: Optional[str] = None
+        self._last_error: Optional[str] = None
 
         self._load_cached_tokens()
+
+        # If refresh_token_env is provided, ensure it is set as active refresh token
+        if self.refresh_token_env:
+            self._refresh_token = self.refresh_token_env
 
     def _load_cached_tokens(self) -> None:
         """Loads cached tokens from zoho_tokens.json if present."""
@@ -78,6 +92,7 @@ class ZohoTokenManager:
         if self._access_token and self._access_token.startswith("mock_"):
             return
         try:
+            TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "access_token": self._access_token,
                 "refresh_token": self._refresh_token,
@@ -157,6 +172,10 @@ class ZohoTokenManager:
             logger.error(f"Exception during Zoho grant exchange: {str(e)}")
             return {"success": False, "error": str(e)}
 
+    def has_refresh_capability(self) -> bool:
+        """Checks if a refresh token and client credentials are configured."""
+        return bool(self._refresh_token or self.refresh_token_env) and self.is_configured()
+
     def refresh_access_token(self) -> dict[str, Any]:
         """
         Uses the refresh token to obtain a fresh access token automatically.
@@ -166,8 +185,12 @@ class ZohoTokenManager:
         client_secret=...
         refresh_token=...
         """
-        if not self._refresh_token:
-            raise ValueError("No refresh token available to refresh access token.")
+        effective_refresh = self._refresh_token or self.refresh_token_env
+        if not effective_refresh:
+            raise ValueError(
+                "No refresh token available to refresh access token. "
+                "Set ZOHO_BOOKS_REFRESH_TOKEN or configure refresh token in zoho_tokens.json."
+            )
         if not self.is_configured():
             raise ValueError("Zoho Books client_id and client_secret must be configured.")
 
@@ -176,7 +199,7 @@ class ZohoTokenManager:
             "grant_type": "refresh_token",
             "client_id": self.client_id,
             "client_secret": self.client_secret,
-            "refresh_token": self._refresh_token,
+            "refresh_token": effective_refresh,
         }
 
         try:
@@ -186,6 +209,7 @@ class ZohoTokenManager:
 
             if "error" in res_data:
                 err_msg = res_data.get("error", "Token refresh failed")
+                self._last_error = err_msg
                 logger.error(f"Zoho OAuth refresh error: {err_msg}")
                 return {"success": False, "error": err_msg}
 
@@ -194,40 +218,58 @@ class ZohoTokenManager:
             api_domain = res_data.get("api_domain")
 
             if not access_token:
-                return {"success": False, "error": "No access_token returned by Zoho."}
+                err_msg = "No access_token returned by Zoho."
+                self._last_error = err_msg
+                return {"success": False, "error": err_msg}
 
             self._access_token = access_token
+            self._refresh_token = effective_refresh
             self._expires_at = time.time() + float(expires_in)
             if api_domain:
                 self._token_api_domain = api_domain
+            self._last_error = None
 
             self._save_cached_tokens()
-            logger.info("Zoho access token refreshed successfully.")
+            logger.info("Zoho access token refreshed and cached successfully.")
             return {
                 "success": True,
                 "expires_in": expires_in,
                 "api_domain": self.get_effective_api_domain(),
             }
         except Exception as e:
-            logger.error(f"Exception during Zoho token refresh: {str(e)}")
-            return {"success": False, "error": str(e)}
+            err_msg = str(e)
+            self._last_error = err_msg
+            logger.error(f"Exception during Zoho token refresh: {err_msg}")
+            return {"success": False, "error": err_msg}
 
     def get_valid_access_token(self) -> Optional[str]:
         """
-        Returns a valid access token. Automatically refreshes if expired.
-        If a grant token is configured but no refresh token yet, tries exchange.
+        Returns a valid access token:
+        1. Checks cached access token: returns it if valid and not expired (with 60s buffer).
+        2. If missing or expired: automatically uses ZOHO_BOOKS_REFRESH_TOKEN to obtain a new access token
+           from https://accounts.zoho.com/oauth/v2/token.
+        3. Caches the newly obtained access token.
+        4. Does NOT require ZOHO_BOOKS_GRANT_TOKEN during normal production operation.
+        5. If refresh token is unavailable, falls back to grant token exchange if configured.
         """
-        # Buffer of 60 seconds before actual expiration
-        if self._access_token and (time.time() + 60.0) < self._expires_at:
+        now = time.time()
+        # 1. Valid cached access token
+        if self._access_token and (now + 60.0) < self._expires_at:
             return self._access_token
 
-        # Try refresh if refresh_token is present
-        if self._refresh_token and self.is_configured():
+        # 2. If missing or expired, automatically use refresh token
+        effective_refresh = self._refresh_token or self.refresh_token_env
+        if effective_refresh and self.is_configured():
+            if not self._refresh_token:
+                self._refresh_token = effective_refresh
             res = self.refresh_access_token()
             if res.get("success"):
                 return self._access_token
+            else:
+                self._last_error = res.get("error", "OAuth refresh failed")
+                logger.error(f"Zoho OAuth refresh flow failed to obtain new access token: {self._last_error}")
 
-        # Try exchange if grant token is present
+        # 3. Fallback: Grant token exchange only if grant token is configured and refresh token was absent
         if self.grant_token and self.is_configured():
             res = self.exchange_grant_token()
             if res.get("success"):
@@ -243,7 +285,7 @@ class ZohoTokenManager:
             "has_client_id": bool(self.client_id),
             "has_secret_configured": bool(self.client_secret),
             "has_grant_code": bool(self.grant_token),
-            "has_refresh_flow": bool(self._refresh_token),
+            "has_refresh_flow": bool(self._refresh_token or self.refresh_token_env),
             "is_authenticated": has_token,
             "api_domain": self.get_effective_api_domain(),
             "accounts_url": self.accounts_url,
@@ -642,32 +684,41 @@ class ZohoBooksService:
         5. Returns None if NOT FOUND, if SKU is blank, or on any error.
         """
         target_sku = (sku or "").strip()
-        if not target_sku:
+        norm_target_sku = normalize_sku(target_sku)
+        if not norm_target_sku:
             return None
 
         org_id = organization_id or self.token_manager.organization_id
-        res = self.list_composite_items(organization_id=org_id, search_text=target_sku)
+        clean_search_text = " ".join(str(sku).strip().split())
+        res = self.list_composite_items(organization_id=org_id, search_text=clean_search_text)
         if not res.get("success"):
             return None
 
         items = res.get("composite_items", [])
+        matching_items: list[dict[str, Any]] = []
         for item in items:
-            item_sku = (item.get("sku") or "").strip()
-            item_part = (item.get("part_number") or "").strip()
+            item_sku = item.get("sku")
+            item_part = item.get("part_number")
 
             is_exact_sku_match = (
-                (item_sku and item_sku.lower() == target_sku.lower()) or
-                (item_part and item_part.lower() == target_sku.lower())
+                (item_sku and normalize_sku(item_sku) == norm_target_sku) or
+                (item_part and normalize_sku(item_part) == norm_target_sku)
             )
 
             if is_exact_sku_match:
                 raw_id = str(item.get("composite_item_id") or item.get("item_id") or "").strip()
                 if raw_id.isdigit() and not raw_id.startswith("ZB-NEW-"):
-                    return item
+                    matching_items.append(item)
                 else:
-                    logger.warning(f"Composite item matched SKU '{target_sku}' but has non-numeric ID: '{raw_id}'")
+                    logger.warning(f"Composite item matched SKU '{sku}' but has non-numeric ID: '{raw_id}'")
 
-        return None
+        if not matching_items:
+            return None
+
+        active_items = [it for it in matching_items if it.get("status") == "active"]
+        if active_items:
+            return active_items[0]
+        return matching_items[0]
 
 
     def find_item_by_exact_sku(
@@ -678,82 +729,60 @@ class ZohoBooksService:
         """
         Searches the REAL Zoho Books API for an exact SKU / Part Number match.
         Target:
-        GET https://www.zohoapis.com/books/v3/items?organization_id={org_id}&search_text={sku}
+        GET https://www.zohoapis.com/books/v3/items?organization_id={org_id}&search_text={clean_sku}
 
-        Strict Matching Rules:
-        1. MUST query the real Zoho Books API; NEVER uses mock data, local catalog, or fixture data.
-        2. Exact SKU / Part Number match in REAL Zoho Books:
-           - Matches item.sku or item.part_number (case-insensitive strip).
-           - Description-only match does NOT qualify as a match.
-        3. Validates that matched item has a real numeric item_id.
-        4. Returns the matched item dictionary if found with valid numeric item_id.
-        5. Returns None if NOT FOUND, if SKU is blank, or on any error (caller classifies as CREATE).
+        Strict Deterministic Matching Rules:
+        1. Exact normalized SKU match is the primary and only matching rule.
+        2. Normalize with trim + case-insensitive comparison (and collapsing internal whitespace).
+        3. If Zoho search returns an item whose normalized `sku` (or `part_number`) matches the incoming SKU,
+           selects that item for UPDATE.
+        4. Preserves the real numeric item_id for the UPDATE operation.
+        5. Does NOT match by description or name before SKU (or at all).
+        6. Returns None if no exact SKU match exists (caller classifies as CREATE).
+        7. If multiple search results returned, selects the one with the exact SKU match (preferring active status).
         """
-        target_sku = (sku or "").strip()
-        if not target_sku:
+        norm_target_sku = normalize_sku(sku)
+        if not norm_target_sku:
             return None
 
         org_id = organization_id or self.token_manager.organization_id
-        token = self.token_manager.get_valid_access_token()
-        if not token:
-            if self.token_manager.grant_token and self.token_manager.is_configured():
-                ex_res = self.token_manager.exchange_grant_token()
-                if ex_res.get("success"):
-                    token = self.token_manager.get_valid_access_token()
+        clean_search_text = " ".join(str(sku).strip().split())
 
-        if not token:
-            logger.warning(f"No Zoho Books access token available for exact SKU lookup of '{target_sku}'.")
+        search_res = self.search_items(
+            search_text=clean_search_text,
+            organization_id=org_id,
+        )
+        if not search_res.get("success"):
             return None
 
-        api_base = self.token_manager.get_effective_api_domain().rstrip("/")
-        url = f"{api_base}/books/v3/items"
-        headers = {
-            "Authorization": f"Zoho-oauthtoken {token}",
-        }
-        params = {
-            "organization_id": org_id,
-            "search_text": target_sku,
-        }
+        items = search_res.get("items", [])
+        matching_items: list[dict[str, Any]] = []
 
-        try:
-            with httpx.Client(timeout=20.0) as client:
-                resp = client.get(url, headers=headers, params=params)
-                if resp.status_code == 401 and self.token_manager._refresh_token:
-                    ref_res = self.token_manager.refresh_access_token()
-                    if ref_res.get("success"):
-                        token = self.token_manager.get_valid_access_token()
-                        headers["Authorization"] = f"Zoho-oauthtoken {token}"
-                        resp = client.get(url, headers=headers, params=params)
+        for item in items:
+            item_sku = item.get("sku")
+            item_part = item.get("part_number")
 
-                if resp.status_code != 200:
-                    logger.warning(f"Zoho Books exact SKU search failed with HTTP {resp.status_code} for SKU '{target_sku}'")
-                    return None
+            # Deterministic exact normalized match rule (NEVER match description or name)
+            is_match = (
+                (item_sku and normalize_sku(item_sku) == norm_target_sku) or
+                (item_part and normalize_sku(item_part) == norm_target_sku)
+            )
 
-                data = resp.json()
-                items = data.get("items", [])
+            if is_match:
+                raw_id = str(item.get("item_id") or "").strip()
+                if raw_id.isdigit():
+                    matching_items.append(item)
+                else:
+                    logger.warning(f"Item matched SKU '{sku}' but has non-numeric item_id: '{raw_id}'")
 
-                for item in items:
-                    item_sku = (item.get("sku") or "").strip()
-                    item_part = (item.get("part_number") or "").strip()
-
-                    # Exact SKU / Part Number equality check (case-insensitive)
-                    is_exact_sku_match = (
-                        (item_sku and item_sku.lower() == target_sku.lower()) or
-                        (item_part and item_part.lower() == target_sku.lower())
-                    )
-
-                    if is_exact_sku_match:
-                        raw_id = str(item.get("item_id") or "").strip()
-                        if raw_id.isdigit():
-                            return item
-                        else:
-                            logger.warning(f"Item matched SKU '{target_sku}' but has non-numeric item_id: '{raw_id}'")
-
-                # No exact SKU match among returned items
-                return None
-        except Exception as e:
-            logger.error(f"Zoho Books API error during exact SKU lookup for '{target_sku}': {e}")
+        if not matching_items:
             return None
+
+        # If multiple search results have exact SKU match, prefer active items
+        active_items = [it for it in matching_items if it.get("status") == "active"]
+        if active_items:
+            return active_items[0]
+        return matching_items[0]
 
     def test_connectivity(self, organization_id: Optional[str] = None) -> dict[str, Any]:
         """
@@ -928,7 +957,12 @@ class ZohoBooksService:
         org_id = organization_id or self.token_manager.organization_id
         token = self.token_manager.get_valid_access_token()
         if not token:
-            raise RuntimeError("No valid Zoho Books access token available.")
+            last_err = getattr(self.token_manager, "_last_error", None)
+            reason = f" (Reason: {last_err})" if last_err else ""
+            raise RuntimeError(
+                f"No valid Zoho Books access token available.{reason} "
+                "Ensure ZOHO_BOOKS_REFRESH_TOKEN (or cached token), ZOHO_BOOKS_CLIENT_ID, and ZOHO_BOOKS_CLIENT_SECRET are configured."
+            )
 
         api_base = self.token_manager.get_effective_api_domain().rstrip("/")
         url = f"{api_base}/books/v3/items/{item_id}"
@@ -937,11 +971,12 @@ class ZohoBooksService:
 
         with httpx.Client(timeout=20.0) as client:
             resp = client.get(url, headers=headers, params=params)
-            if resp.status_code == 401 and self.token_manager._refresh_token:
-                self.token_manager.refresh_access_token()
-                token = self.token_manager.get_valid_access_token()
-                headers["Authorization"] = f"Zoho-oauthtoken {token}"
-                resp = client.get(url, headers=headers, params=params)
+            if resp.status_code == 401 and self.token_manager.has_refresh_capability():
+                ref_res = self.token_manager.refresh_access_token()
+                if ref_res.get("success"):
+                    token = self.token_manager.get_valid_access_token()
+                    headers["Authorization"] = f"Zoho-oauthtoken {token}"
+                    resp = client.get(url, headers=headers, params=params)
             return resp.json()
 
     def create_item(self, payload: dict[str, Any], organization_id: Optional[str] = None) -> dict[str, Any]:
@@ -949,7 +984,12 @@ class ZohoBooksService:
         org_id = organization_id or self.token_manager.organization_id
         token = self.token_manager.get_valid_access_token()
         if not token:
-            raise RuntimeError("No valid Zoho Books access token available.")
+            last_err = getattr(self.token_manager, "_last_error", None)
+            reason = f" (Reason: {last_err})" if last_err else ""
+            raise RuntimeError(
+                f"No valid Zoho Books access token available.{reason} "
+                "Ensure ZOHO_BOOKS_REFRESH_TOKEN (or cached token), ZOHO_BOOKS_CLIENT_ID, and ZOHO_BOOKS_CLIENT_SECRET are configured."
+            )
 
         api_base = self.token_manager.get_effective_api_domain().rstrip("/")
         url = f"{api_base}/books/v3/items"
@@ -961,11 +1001,12 @@ class ZohoBooksService:
 
         with httpx.Client(timeout=25.0) as client:
             resp = client.post(url, headers=headers, params=params, json=payload)
-            if resp.status_code == 401 and self.token_manager._refresh_token:
-                self.token_manager.refresh_access_token()
-                token = self.token_manager.get_valid_access_token()
-                headers["Authorization"] = f"Zoho-oauthtoken {token}"
-                resp = client.post(url, headers=headers, params=params, json=payload)
+            if resp.status_code == 401 and self.token_manager.has_refresh_capability():
+                ref_res = self.token_manager.refresh_access_token()
+                if ref_res.get("success"):
+                    token = self.token_manager.get_valid_access_token()
+                    headers["Authorization"] = f"Zoho-oauthtoken {token}"
+                    resp = client.post(url, headers=headers, params=params, json=payload)
             return resp.json()
 
     def update_item(self, item_id: str, payload: dict[str, Any], organization_id: Optional[str] = None) -> dict[str, Any]:
@@ -977,7 +1018,12 @@ class ZohoBooksService:
         org_id = organization_id or self.token_manager.organization_id
         token = self.token_manager.get_valid_access_token()
         if not token:
-            raise RuntimeError("No valid Zoho Books access token available.")
+            last_err = getattr(self.token_manager, "_last_error", None)
+            reason = f" (Reason: {last_err})" if last_err else ""
+            raise RuntimeError(
+                f"No valid Zoho Books access token available.{reason} "
+                "Ensure ZOHO_BOOKS_REFRESH_TOKEN (or cached token), ZOHO_BOOKS_CLIENT_ID, and ZOHO_BOOKS_CLIENT_SECRET are configured."
+            )
 
         api_base = self.token_manager.get_effective_api_domain().rstrip("/")
         url = f"{api_base}/books/v3/items/{item_id}"
@@ -989,11 +1035,12 @@ class ZohoBooksService:
 
         with httpx.Client(timeout=20.0) as client:
             resp = client.put(url, headers=headers, params=params, json=payload)
-            if resp.status_code == 401 and self.token_manager._refresh_token:
-                self.token_manager.refresh_access_token()
-                token = self.token_manager.get_valid_access_token()
-                headers["Authorization"] = f"Zoho-oauthtoken {token}"
-                resp = client.put(url, headers=headers, params=params, json=payload)
+            if resp.status_code == 401 and self.token_manager.has_refresh_capability():
+                ref_res = self.token_manager.refresh_access_token()
+                if ref_res.get("success"):
+                    token = self.token_manager.get_valid_access_token()
+                    headers["Authorization"] = f"Zoho-oauthtoken {token}"
+                    resp = client.put(url, headers=headers, params=params, json=payload)
             return resp.json()
 
     def controlled_update_test(

@@ -2304,5 +2304,538 @@ def test_find_composite_item_by_exact_sku(monkeypatch):
     assert empty is None
 
 
+# ============================================================================
+# Zoho Books Deterministic SKU Matching & Stage 4 Preview Tests
+# ============================================================================
+
+def test_normalize_sku_utility():
+    """Verify normalize_sku trims leading/trailing whitespace, collapses internal whitespace, and lowercases."""
+    from app.utils.text_utils import normalize_sku
+
+    # Exact trim and lowercase
+    assert normalize_sku("RV BL 200 4TS") == "rv bl 200 4ts"
+    # Case variation
+    assert normalize_sku("rv bl 200 4ts") == "rv bl 200 4ts"
+    assert normalize_sku("Rv Bl 200 4ts") == "rv bl 200 4ts"
+    # Leading and trailing whitespace
+    assert normalize_sku("  RV BL 200 4TS  ") == "rv bl 200 4ts"
+    # Repeated internal whitespace
+    assert normalize_sku("RV   BL   200   4TS") == "rv bl 200 4ts"
+    assert normalize_sku("  rv \t bl \n 200   4ts  ") == "rv bl 200 4ts"
+    # Empty and None
+    assert normalize_sku("") == ""
+    assert normalize_sku(None) == ""
+    # Different SKU
+    assert normalize_sku("RV BL 300 4TS") == "rv bl 300 4ts"
+    assert normalize_sku("RV BL 200 4TS") != normalize_sku("RV BL 300 4TS")
+
+
+def test_zoho_find_item_by_exact_sku_deterministic(monkeypatch):
+    """
+    Test Zoho Books deterministic matching logic:
+    - exact SKU -> UPDATE
+    - case/whitespace variation -> UPDATE
+    - different SKU -> CREATE (returns None)
+    - multiple search results where one has exact SKU -> selects exact SKU
+    - never matches by description or name before SKU
+    """
+    from app.services.zoho_books_service import zoho_books_service
+
+    # Simulated Zoho Books API search response containing multiple items
+    # (some with matching name or description, but different SKU; one with exact SKU)
+    simulated_zoho_items = [
+        {
+            "item_id": "2552396000010001001",
+            "sku": "SPARE-BL-200",
+            "name": "RV BL 200 4TS : Spare Gasket Set",
+            "description": "Spare gasket for RV BL 200 4TS rotary valve",
+            "rate": 5000.0,
+            "status": "active"
+        },
+        {
+            "item_id": "2552396000020398002",
+            "sku": "RV BL 200 4TS",
+            "name": "BL 200 4TS : BL - Rotary valve",
+            "description": "Rotary valve complete assembly",
+            "rate": 151104722.22,
+            "status": "active"
+        },
+        {
+            "item_id": "2552396000030003003",
+            "sku": "ACC-VALVE-200",
+            "name": "Accessory for BL 200 4TS",
+            "description": "Mounting flange for RV BL 200 4TS",
+            "rate": 12000.0,
+            "status": "active"
+        }
+    ]
+
+    def mock_search_items(search_text, organization_id=None):
+        return {
+            "success": True,
+            "source": "live_zoho_api",
+            "organization_id": organization_id or "741367552",
+            "search_text": search_text,
+            "items": simulated_zoho_items,
+            "count": len(simulated_zoho_items)
+        }
+
+    monkeypatch.setattr(zoho_books_service, "search_items", mock_search_items)
+
+    # 1. Exact SKU -> returns exact item and preserves item_id
+    matched = zoho_books_service.find_item_by_exact_sku("RV BL 200 4TS")
+    assert matched is not None
+    assert matched["item_id"] == "2552396000020398002"
+    assert matched["sku"] == "RV BL 200 4TS"
+
+    # 2. Case variation -> UPDATE (case-insensitive exact match)
+    matched_lower = zoho_books_service.find_item_by_exact_sku("rv bl 200 4ts")
+    assert matched_lower is not None
+    assert matched_lower["item_id"] == "2552396000020398002"
+
+    # 3. Whitespace variation (trim + collapsed whitespace) -> UPDATE
+    matched_ws = zoho_books_service.find_item_by_exact_sku("  RV   BL   200   4TS  ")
+    assert matched_ws is not None
+    assert matched_ws["item_id"] == "2552396000020398002"
+
+    # 4. Multiple search results where one has exact SKU -> selects exact SKU
+    # Note: SPARE-BL-200 comes FIRST in simulated_zoho_items, but find_item_by_exact_sku must select RV BL 200 4TS
+    assert matched["sku"] == "RV BL 200 4TS"
+    assert matched["sku"] != "SPARE-BL-200"
+
+    # 5. Different SKU -> returns None (classified as CREATE)
+    # Even though simulated_zoho_items[0] and [2] have "RV BL 200 4TS" in description/name,
+    # searching for "RV BL 300 4TS" must NOT match them!
+    different_sku = zoho_books_service.find_item_by_exact_sku("RV BL 300 4TS")
+    assert different_sku is None
+
+    # 6. Description/name match attempt -> NEVER matches by description or name
+    desc_only = zoho_books_service.find_item_by_exact_sku("Spare Gasket Set")
+    assert desc_only is None
+
+    name_only = zoho_books_service.find_item_by_exact_sku("BL 200 4TS : BL - Rotary valve")
+    assert name_only is None
+
+
+def test_stage4_zoho_preview_deterministic_classification(monkeypatch):
+    """
+    Test Stage 4 preview_zoho_sync classification via POST /api/supplier-pricing/zoho-preview:
+    - exact SKU -> UPDATE with preserved item_id
+    - case/whitespace variation -> UPDATE with preserved item_id
+    - different SKU -> CREATE with existing_item_id None
+    - multiple search results where one has exact SKU -> correctly selects UPDATE
+    """
+    from app.services.zoho_books_service import zoho_books_service
+
+    catalog_data = {
+        "rv bl 200 4ts": {
+            "item_id": "2552396000020398002",
+            "sku": "RV BL 200 4TS",
+            "name": "BL 200 4TS : BL - Rotary valve",
+            "rate": 151104722.22,
+            "status": "active"
+        }
+    }
+
+    def mock_search_items(search_text, organization_id=None):
+        # Simulate Zoho search returning candidates
+        from app.utils.text_utils import normalize_sku
+        norm = normalize_sku(search_text)
+        results = []
+        if "rv bl 200" in norm:
+            # Include an accessory/partial match first to test multiple search results
+            results.append({
+                "item_id": "2552396000099990001",
+                "sku": "ACC-BL-200",
+                "name": "Accessory for RV BL 200 4TS",
+                "description": "Accessory",
+                "rate": 1000.0,
+                "status": "active"
+            })
+            if norm == "rv bl 200 4ts":
+                results.append(catalog_data["rv bl 200 4ts"])
+        return {
+            "success": True,
+            "items": results,
+            "count": len(results)
+        }
+
+    monkeypatch.setattr(zoho_books_service, "search_items", mock_search_items)
+
+    preview_payload = {
+        "quotation": {
+            "quotation_number": "QT-STAGE4-TEST",
+            "supplier_name": "DMN Westinghouse",
+            "currency": "EUR",
+            "items": []
+        },
+        "pricing_summary": {
+            "total_supplier_net": 100000.0,
+            "total_landed_cost": 120000.0,
+            "total_selling_price": 150000.0,
+            "total_gross_profit": 30000.0,
+            "overall_margin_percent": 20.0,
+            "supplier_currency": "EUR",
+            "target_currency": "EUR",
+            "items_count": 3
+        },
+        "calculated_items": [
+            # 1. Exact SKU
+            {
+                "line_number": 1,
+                "part_number": "RV BL 200 4TS",
+                "description": "BL 200 4TS Rotary valve",
+                "quantity": 1.0,
+                "unit": "NOS",
+                "supplier_currency": "EUR",
+                "target_currency": "EUR",
+                "supplier_unit_price": 100000.0,
+                "discount_percent": 0.0,
+                "discount_amount_unit": 0.0,
+                "net_supplier_unit_price": 100000.0,
+                "net_supplier_total": 100000.0,
+                "exchange_rate": 1.0,
+                "converted_unit_price": 100000.0,
+                "packing_charge_unit": 0.0,
+                "freight_charge_unit": 0.0,
+                "customs_duty_unit": 0.0,
+                "local_handling_unit": 0.0,
+                "landed_cost_unit": 100000.0,
+                "landed_cost_total": 100000.0,
+                "margin_percent": 20.0,
+                "margin_method": "on_selling",
+                "margin_amount_unit": 25000.0,
+                "final_unit_selling_price": 125000.0,
+                "final_total_selling_price": 125000.0,
+                "profit_total": 25000.0
+            },
+            # 2. Case and whitespace variation
+            {
+                "line_number": 2,
+                "part_number": "  rv   bl 200 4ts  ",
+                "description": "BL 200 4TS Rotary valve variant casing",
+                "quantity": 1.0,
+                "unit": "NOS",
+                "supplier_currency": "EUR",
+                "target_currency": "EUR",
+                "supplier_unit_price": 100000.0,
+                "discount_percent": 0.0,
+                "discount_amount_unit": 0.0,
+                "net_supplier_unit_price": 100000.0,
+                "net_supplier_total": 100000.0,
+                "exchange_rate": 1.0,
+                "converted_unit_price": 100000.0,
+                "packing_charge_unit": 0.0,
+                "freight_charge_unit": 0.0,
+                "customs_duty_unit": 0.0,
+                "local_handling_unit": 0.0,
+                "landed_cost_unit": 100000.0,
+                "landed_cost_total": 100000.0,
+                "margin_percent": 20.0,
+                "margin_method": "on_selling",
+                "margin_amount_unit": 25000.0,
+                "final_unit_selling_price": 125000.0,
+                "final_total_selling_price": 125000.0,
+                "profit_total": 25000.0
+            },
+            # 3. Different SKU -> Must classify as CREATE
+            {
+                "line_number": 3,
+                "part_number": "RV BL 999 NEW",
+                "description": "Completely new SKU not in Zoho",
+                "quantity": 1.0,
+                "unit": "NOS",
+                "supplier_currency": "EUR",
+                "target_currency": "EUR",
+                "supplier_unit_price": 50000.0,
+                "discount_percent": 0.0,
+                "discount_amount_unit": 0.0,
+                "net_supplier_unit_price": 50000.0,
+                "net_supplier_total": 50000.0,
+                "exchange_rate": 1.0,
+                "converted_unit_price": 50000.0,
+                "packing_charge_unit": 0.0,
+                "freight_charge_unit": 0.0,
+                "customs_duty_unit": 0.0,
+                "local_handling_unit": 0.0,
+                "landed_cost_unit": 50000.0,
+                "landed_cost_total": 50000.0,
+                "margin_percent": 20.0,
+                "margin_method": "on_selling",
+                "margin_amount_unit": 12500.0,
+                "final_unit_selling_price": 62500.0,
+                "final_total_selling_price": 62500.0,
+                "profit_total": 12500.0
+            }
+        ],
+        "zoho_config": {
+            "organization_id": "741367552",
+            "environment": "production",
+            "sync_mode": "items_only"
+        }
+    }
+
+    res = client.post("/api/supplier-pricing/zoho-preview", json=preview_payload)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is True
+
+    # Check counts
+    assert data["matched_existing_count"] == 2
+    assert data["new_sku_count"] == 1
+    assert data["total_items"] == 3
+
+    # Items to update
+    items_to_update = data["items_to_update"]
+    assert len(items_to_update) == 2
+
+    # Exact SKU -> UPDATE with preserved Zoho item_id
+    item1 = next(it for it in items_to_update if it["part_number"] == "RV BL 200 4TS")
+    assert item1["action"] == "UPDATE"
+    assert item1["existing_item_id"] == "2552396000020398002"
+    assert "2552396000020398002" in item1["notes"]
+
+    # Case/whitespace variation -> UPDATE with preserved Zoho item_id
+    item2 = next(it for it in items_to_update if "rv   bl 200 4ts" in it["part_number"])
+    assert item2["action"] == "UPDATE"
+    assert item2["existing_item_id"] == "2552396000020398002"
+
+    # Items to create
+    items_to_create = data["items_to_create"]
+    assert len(items_to_create) == 1
+    item3 = items_to_create[0]
+    assert item3["part_number"] == "RV BL 999 NEW"
+    assert item3["action"] == "CREATE"
+    assert item3["existing_item_id"] is None
+
+
+# ============================================================================
+# Zoho Books Token Lifecycle & Production OAuth Resilience Tests
+# ============================================================================
+
+def test_token_manager_valid_cached_access_token():
+    """
+    1. The service first checks the cached access token.
+    If valid and not expired, returns it directly without attempting refresh.
+    """
+    from app.services.zoho_books_service import ZohoTokenManager
+    import time
+
+    tm = ZohoTokenManager()
+    tm.persist_tokens = False
+    tm._access_token = "valid_cached_test_token"
+    tm._expires_at = time.time() + 3600.0  # valid for 1 hour
+
+    # Calling get_valid_access_token must return the cached token immediately
+    token = tm.get_valid_access_token()
+    assert token == "valid_cached_test_token"
+
+
+def test_token_manager_missing_access_token_triggers_refresh(monkeypatch):
+    """
+    2. If access token is missing, automatically uses ZOHO_BOOKS_REFRESH_TOKEN
+    to obtain a new access token from accounts.zoho.com and caches it.
+    """
+    from app.services.zoho_books_service import ZohoTokenManager
+    import httpx
+    import time
+
+    tm = ZohoTokenManager()
+    tm.persist_tokens = False
+    tm.client_id = "test_client_id"
+    tm.client_secret = "test_client_secret"
+    tm._access_token = None
+    tm._expires_at = 0.0
+    tm._refresh_token = "test_refresh_token_123"
+
+    calls = []
+
+    def mock_post(self, url, *args, **kwargs):
+        calls.append({"url": str(url), "data": kwargs.get("data")})
+        if "oauth/v2/token" in str(url):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "access_token": "mock_new_access_token_from_refresh",
+                    "expires_in": 3600,
+                    "api_domain": "https://www.zohoapis.com"
+                },
+                request=httpx.Request("POST", str(url))
+            )
+        return httpx.Response(status_code=400, request=httpx.Request("POST", str(url)))
+
+    monkeypatch.setattr(httpx.Client, "post", mock_post)
+
+    token = tm.get_valid_access_token()
+    assert token == "mock_new_access_token_from_refresh"
+    assert tm._access_token == "mock_new_access_token_from_refresh"
+    assert tm._expires_at > time.time() + 3000
+    assert len(calls) == 1
+    assert calls[0]["data"].get("grant_type") == "refresh_token"
+    assert calls[0]["data"].get("refresh_token") == "test_refresh_token_123"
+
+
+def test_token_manager_expired_access_token_triggers_refresh(monkeypatch):
+    """
+    3. If access token is expired (or within 60s buffer), automatically uses
+    refresh token to obtain a fresh access token.
+    """
+    from app.services.zoho_books_service import ZohoTokenManager
+    import httpx
+    import time
+
+    tm = ZohoTokenManager()
+    tm.persist_tokens = False
+    tm.client_id = "test_client_id"
+    tm.client_secret = "test_client_secret"
+    tm._access_token = "expired_old_token"
+    tm._expires_at = time.time() - 30.0  # expired 30s ago
+    tm._refresh_token = "test_refresh_token_abc"
+
+    def mock_post(self, url, *args, **kwargs):
+        if "oauth/v2/token" in str(url):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "access_token": "mock_refreshed_after_expiry",
+                    "expires_in": 3600,
+                    "api_domain": "https://www.zohoapis.com"
+                },
+                request=httpx.Request("POST", str(url))
+            )
+        return httpx.Response(status_code=400, request=httpx.Request("POST", str(url)))
+
+    monkeypatch.setattr(httpx.Client, "post", mock_post)
+
+    token = tm.get_valid_access_token()
+    assert token == "mock_refreshed_after_expiry"
+    assert tm._access_token == "mock_refreshed_after_expiry"
+
+
+def test_zoho_create_item_401_refreshes_and_retries_once(monkeypatch):
+    """
+    7. Handle HTTP 401 by refreshing the access token once and retrying the request once.
+    """
+    from app.services.zoho_books_service import ZohoBooksService
+    import httpx
+    import time
+
+    service = ZohoBooksService()
+    tm = service.token_manager
+    tm.persist_tokens = False
+    tm.client_id = "test_client_id"
+    tm.client_secret = "test_client_secret"
+    tm._access_token = "stale_token_causing_401"
+    tm._expires_at = time.time() + 3600.0
+    tm._refresh_token = "valid_refresh_token"
+
+    api_attempts = []
+
+    def mock_post(self, url, *args, **kwargs):
+        url_str = str(url)
+        if "oauth/v2/token" in url_str:
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "access_token": "fresh_token_after_401",
+                    "expires_in": 3600,
+                    "api_domain": "https://www.zohoapis.com"
+                },
+                request=httpx.Request("POST", url_str)
+            )
+        elif "/books/v3/items" in url_str:
+            headers = kwargs.get("headers", {})
+            auth_header = headers.get("Authorization", "")
+            api_attempts.append(auth_header)
+            if "stale_token_causing_401" in auth_header:
+                return httpx.Response(
+                    status_code=401,
+                    json={"code": 57, "message": "You are not authorized to perform this operation"},
+                    request=httpx.Request("POST", url_str)
+                )
+            elif "fresh_token_after_401" in auth_header:
+                return httpx.Response(
+                    status_code=201,
+                    json={
+                        "code": 0,
+                        "message": "The item has been created.",
+                        "item": {
+                            "item_id": "2552396000099999888",
+                            "name": "Test Retry Item",
+                            "rate": 1500.0,
+                            "sku": "TEST-RETRY-401"
+                        }
+                    },
+                    request=httpx.Request("POST", url_str)
+                )
+        return httpx.Response(status_code=400, request=httpx.Request("POST", url_str))
+
+    monkeypatch.setattr(httpx.Client, "post", mock_post)
+
+    res = service.create_item({
+        "name": "Test Retry Item",
+        "sku": "TEST-RETRY-401",
+        "rate": 1500.0
+    })
+
+    assert res.get("code") == 0
+    assert res.get("item", {}).get("item_id") == "2552396000099999888"
+    assert len(api_attempts) == 2
+    assert "stale_token_causing_401" in api_attempts[0]
+    assert "fresh_token_after_401" in api_attempts[1]
+
+
+def test_token_manager_refresh_failure_raises_actionable_error(monkeypatch):
+    """
+    11. Refresh failure produces a clear actionable error message.
+    """
+    from app.services.zoho_books_service import ZohoBooksService
+    import httpx
+
+    service = ZohoBooksService()
+    tm = service.token_manager
+    tm.persist_tokens = False
+    tm.client_id = "test_client_id"
+    tm.client_secret = "test_client_secret"
+    tm._access_token = None
+    tm._expires_at = 0.0
+    tm._refresh_token = "invalid_expired_refresh_token"
+
+    def mock_post(self, url, *args, **kwargs):
+        if "oauth/v2/token" in str(url):
+            return httpx.Response(
+                status_code=200,
+                json={"error": "invalid_token"},
+                request=httpx.Request("POST", str(url))
+            )
+        return httpx.Response(status_code=400, request=httpx.Request("POST", str(url)))
+
+    monkeypatch.setattr(httpx.Client, "post", mock_post)
+
+    # get_valid_access_token returns None on refresh failure and records error
+    token = tm.get_valid_access_token()
+    assert token is None
+    assert tm._last_error == "invalid_token"
+
+    # Calling create_item raises clear actionable RuntimeError
+    with pytest.raises(RuntimeError) as exc_info:
+        service.create_item({"name": "Fail Item", "rate": 100})
+
+    err_str = str(exc_info.value)
+    assert "No valid Zoho Books access token available" in err_str
+    assert "invalid_token" in err_str
+    assert "ZOHO_BOOKS_REFRESH_TOKEN" in err_str
+
+    # Calling refresh_access_token without any refresh token raises clear ValueError
+    tm._refresh_token = None
+    tm.refresh_token_env = ""
+    with pytest.raises(ValueError) as val_info:
+        tm.refresh_access_token()
+    assert "No refresh token available" in str(val_info.value)
+    assert "ZOHO_BOOKS_REFRESH_TOKEN" in str(val_info.value)
+
+
+
+
 
 
