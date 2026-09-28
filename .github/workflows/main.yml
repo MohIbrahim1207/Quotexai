@@ -16,25 +16,81 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+
           script: |
             set -e
 
             cd /opt/quotexai/quotexai
 
-            echo "Pulling latest code..."
+            echo "========================================"
+            echo "Starting QuotexAI deployment"
+            echo "========================================"
+
+            echo "1. Resetting VPS working tree..."
+            git reset --hard HEAD
+
+            echo "2. Pulling latest code from GitHub..."
             git pull origin main
 
-            echo "Validating Docker configuration..."
-            docker compose config > /dev/null
+            echo "3. Checking current Git commit..."
+            git rev-parse --short HEAD
 
-            echo "Building containers..."
-            docker compose build
+            echo "4. Validating Docker Compose configuration..."
+            docker compose --env-file .env config > /dev/null
 
-            echo "Starting QuotexAI..."
-            docker compose up -d
+            echo "Docker configuration: OK"
 
-            echo "Checking containers..."
+            echo "5. Building Docker containers..."
+            docker compose --env-file .env build
+
+            echo "Docker build: OK"
+
+            echo "6. Starting QuotexAI..."
+            docker compose --env-file .env up -d
+
+            echo "7. Waiting for backend..."
+            sleep 10
+
+            echo "8. Checking containers..."
             docker compose ps
 
-            echo "Deployment completed successfully."
-            
+            echo "9. Checking backend container..."
+            if ! docker ps --format '{{.Names}}' | grep -q '^quotexai_backend$'; then
+              echo "ERROR: quotexai_backend is not running"
+              docker logs --tail 100 quotexai_backend || true
+              exit 1
+            fi
+
+            echo "Backend container: RUNNING"
+
+            echo "10. Checking Zoho refresh token..."
+            if docker exec quotexai_backend sh -c 'test -n "$ZOHO_BOOKS_REFRESH_TOKEN"'; then
+              echo "Zoho refresh token: SET"
+            else
+              echo "ERROR: Zoho refresh token is missing"
+              exit 1
+            fi
+
+            echo "11. Checking backend health..."
+
+            for i in 1 2 3 4 5; do
+              if docker exec quotexai_backend sh -c \
+                'curl -fsS http://127.0.0.1:8000/api/health > /dev/null'; then
+
+                echo "Backend health check: OK"
+                break
+              fi
+
+              if [ "$i" -eq 5 ]; then
+                echo "ERROR: Backend health check failed"
+                docker logs --tail 100 quotexai_backend || true
+                exit 1
+              fi
+
+              echo "Backend not ready yet... retrying"
+              sleep 5
+            done
+
+            echo "========================================"
+            echo "Deployment completed successfully"
+            echo "========================================"
